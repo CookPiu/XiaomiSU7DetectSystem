@@ -10,8 +10,62 @@ from PyQt5.QtGui import QPixmap, QImage
 from PyQt5.QtCore import Qt, QTimer
 
 class ObjectDetector:
-    def __init__(self, model_path):
-        self.session = ort.InferenceSession(model_path)
+    def __init__(self, model_path, use_gpu=False):
+        # 配置推理会话选项
+        session_options = ort.SessionOptions()
+        
+        # 检查CUDA环境
+        self.cuda_available = self._check_cuda_available()
+        
+        # 根据use_gpu参数和CUDA可用性决定是否使用GPU
+        if use_gpu:
+            if self.cuda_available:
+                try:
+                    # 尝试使用GPU进行推理
+                    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+                    self.session = ort.InferenceSession(model_path, sess_options=session_options, providers=providers)
+                    # 验证是否真的使用了GPU
+                    if 'CUDAExecutionProvider' in self.session.get_providers():
+                        self.device = "GPU"
+                    else:
+                        self.device = "CPU (GPU初始化失败)"
+                except Exception as e:
+                    # 如果GPU不可用，回退到CPU
+                    error_msg = f"GPU加速初始化失败，错误信息: {e}"
+                    print(error_msg)
+                    providers = ['CPUExecutionProvider']
+                    self.session = ort.InferenceSession(model_path, sess_options=session_options, providers=providers)
+                    self.device = "CPU (GPU初始化失败)"
+            else:
+                # CUDA环境不可用
+                providers = ['CPUExecutionProvider']
+                self.session = ort.InferenceSession(model_path, sess_options=session_options, providers=providers)
+                self.device = "CPU (CUDA环境不可用)"
+        else:
+            # 使用CPU进行推理
+            providers = ['CPUExecutionProvider']
+            self.session = ort.InferenceSession(model_path, sess_options=session_options, providers=providers)
+            self.device = "CPU"
+        
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_names = [output.name for output in self.session.get_outputs()]
+        # 使用固定的输入尺寸，YOLOv8默认为640x640
+        self.img_size = (640, 640)
+    
+    def _check_cuda_available(self):
+        """检查CUDA环境是否可用"""
+        try:
+            # 检查ONNX Runtime是否支持CUDA
+            providers = ort.get_available_providers()
+            if 'CUDAExecutionProvider' in providers:
+                return True
+            else:
+                print("ONNX Runtime不支持CUDA，可用的提供程序:", providers)
+                return False
+        except Exception as e:
+            print(f"检查CUDA环境时出错: {e}")
+            return False
+            
         self.input_name = self.session.get_inputs()[0].name
         self.output_names = [output.name for output in self.session.get_outputs()]
         # 使用固定的输入尺寸，YOLOv8默认为640x640
@@ -105,7 +159,7 @@ class ObjectDetector:
 class DetectionApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("小米SU7检测系统")
+        self.setWindowTitle("Xiaomi SU7 Detection System")
         self.setGeometry(100, 100, 1200, 800)
         
         # 初始化变量
@@ -121,9 +175,10 @@ class DetectionApp(QMainWindow):
             "YOLOv8s": os.path.join("weight", "v8s.onnx")
         }
         
-        # 默认加载YOLOv8n模型
+        # 默认加载YOLOv8n模型，默认使用CPU
         self.current_model = "YOLOv8n"
-        self.detector = ObjectDetector(self.model_paths[self.current_model])
+        self.use_gpu = False
+        self.detector = ObjectDetector(self.model_paths[self.current_model], self.use_gpu)
         
         # 设置界面
         self.setup_ui()
@@ -137,7 +192,7 @@ class DetectionApp(QMainWindow):
         control_layout = QVBoxLayout(control_panel)
         
         # 模型选择
-        model_group = QGroupBox("模型选择")
+        model_group = QGroupBox("Model Selection")
         model_layout = QVBoxLayout(model_group)
         self.model_combo = QComboBox()
         self.model_combo.addItems(["YOLOv8n", "YOLOv8s"])
@@ -146,29 +201,32 @@ class DetectionApp(QMainWindow):
         control_layout.addWidget(model_group)
         
         # 输入选择
-        input_group = QGroupBox("输入选择")
+        input_group = QGroupBox("Input Selection")
         input_layout = QVBoxLayout(input_group)
-        self.image_btn = QPushButton("选择图片")
+        self.image_btn = QPushButton("Select Image")
         self.image_btn.clicked.connect(self.load_image)
-        self.video_btn = QPushButton("选择视频")
+        self.video_btn = QPushButton("Select Video")
         self.video_btn.clicked.connect(self.load_video)
-        self.camera_btn = QPushButton("打开摄像头")
+        self.camera_btn = QPushButton("Open Camera")
         self.camera_btn.clicked.connect(self.open_camera)
-        self.stop_btn = QPushButton("停止")
+        self.stop_btn = QPushButton("Stop")
         self.stop_btn.clicked.connect(self.stop_detection)
+        self.save_btn = QPushButton("Save Result")
+        self.save_btn.clicked.connect(self.save_result)
         input_layout.addWidget(self.image_btn)
         input_layout.addWidget(self.video_btn)
         input_layout.addWidget(self.camera_btn)
         input_layout.addWidget(self.stop_btn)
+        input_layout.addWidget(self.save_btn)
         control_layout.addWidget(input_group)
         
         # 检测参数
-        param_group = QGroupBox("检测参数")
+        param_group = QGroupBox("Detection Parameters")
         param_layout = QVBoxLayout(param_group)
         
         # 置信度阈值
         conf_layout = QHBoxLayout()
-        conf_label = QLabel("置信度阈值:")
+        conf_label = QLabel("Confidence Threshold:")
         self.conf_slider = QSlider(Qt.Horizontal)
         self.conf_slider.setMinimum(1)
         self.conf_slider.setMaximum(99)
@@ -182,7 +240,7 @@ class DetectionApp(QMainWindow):
         
         # IOU阈值
         iou_layout = QHBoxLayout()
-        iou_label = QLabel("IOU阈值:")
+        iou_label = QLabel("IOU Threshold:")
         self.iou_slider = QSlider(Qt.Horizontal)
         self.iou_slider.setMinimum(1)
         self.iou_slider.setMaximum(99)
@@ -193,6 +251,24 @@ class DetectionApp(QMainWindow):
         iou_layout.addWidget(self.iou_slider)
         iou_layout.addWidget(self.iou_value)
         param_layout.addLayout(iou_layout)
+        
+        # GPU加速选项
+        gpu_layout = QHBoxLayout()
+        gpu_label = QLabel("Device:")
+        self.gpu_radio = QRadioButton("GPU")
+        self.cpu_radio = QRadioButton("CPU")
+        self.cpu_radio.setChecked(True)  # 默认使用CPU
+        
+        # 创建按钮组
+        device_group = QButtonGroup(self)
+        device_group.addButton(self.gpu_radio)
+        device_group.addButton(self.cpu_radio)
+        device_group.buttonClicked.connect(self.change_device)
+        
+        gpu_layout.addWidget(gpu_label)
+        gpu_layout.addWidget(self.cpu_radio)
+        gpu_layout.addWidget(self.gpu_radio)
+        param_layout.addLayout(gpu_layout)
         
         control_layout.addWidget(param_group)
         
@@ -212,7 +288,7 @@ class DetectionApp(QMainWindow):
         
         # 状态栏
         status_layout = QHBoxLayout()
-        self.status_label = QLabel("就绪")
+        self.status_label = QLabel("Ready")
         status_layout.addWidget(self.status_label)
         display_layout.addLayout(status_layout)
         
@@ -235,21 +311,33 @@ class DetectionApp(QMainWindow):
     
     def change_model(self, model_name):
         self.current_model = model_name
-        self.detector = ObjectDetector(self.model_paths[model_name])
-        self.status_label.setText(f"已加载模型: {model_name}")
+        self.detector = ObjectDetector(self.model_paths[model_name], self.use_gpu)
+        device_info = f"({self.detector.device})" if hasattr(self.detector, 'device') else ""
+        self.status_label.setText(f"Model loaded: {model_name} {device_info}")
+        
+    def change_device(self, button):
+        # 更新GPU使用状态
+        self.use_gpu = (button == self.gpu_radio)
+        
+        # 重新加载当前模型
+        self.detector = ObjectDetector(self.model_paths[self.current_model], self.use_gpu)
+        
+        # 更新状态栏
+        device_info = f"({self.detector.device})" if hasattr(self.detector, 'device') else ""
+        self.status_label.setText(f"Model loaded: {self.current_model} {device_info}")
     
     def load_image(self):
         # 停止任何正在进行的视频检测
         self.stop_detection()
         
         # 打开文件对话框选择图片
-        file_path, _ = QFileDialog.getOpenFileName(self, "选择图片", "", "图片文件 (*.jpg *.jpeg *.png *.bmp)")
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Image", "", "Image Files (*.jpg *.jpeg *.png *.bmp)")
         
         if file_path:
             # 读取图片
             self.image = cv2.imread(file_path)
             if self.image is None:
-                self.status_label.setText("无法读取图片")
+                self.status_label.setText("Failed to read image")
                 return
             
             # 进行检测
@@ -270,20 +358,30 @@ class DetectionApp(QMainWindow):
         detections = self.detector.detect(display_image, conf_threshold, iou_threshold)
         
         # 在图像上绘制检测结果
+        su7_count = 0
         for det in detections:
             box = det['box']
             score = det['score']
+            class_id = det['class_id']
+            
+            # 确定标签文本和颜色
+            if class_id == 0:
+                label_text = f"SU7: {score:.2f}"
+                color = (0, 255, 0)  # 绿色
+                su7_count += 1
+            else:
+                label_text = f"Other: {score:.2f}"
+                color = (0, 165, 255)  # 橙色
             
             # 绘制边界框
-            cv2.rectangle(display_image, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 2)
+            cv2.rectangle(display_image, (box[0], box[1]), (box[2], box[3]), color, 2)
             
             # 绘制标签
-            label = f"Object-{det['class_id']}: {score:.2f}"
-            cv2.putText(display_image, label, (box[0], box[1] - 10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            cv2.putText(display_image, label_text, (box[0], box[1] - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
-        # 更新状态
-        self.status_label.setText(f"检测到 {len(detections)} 个小米SU7")
+        # 更新状态，只显示SU7的数量
+        self.status_label.setText(f"Detected {su7_count} Xiaomi SU7")
         
         # 显示图像
         self.display_image(display_image)
@@ -293,18 +391,18 @@ class DetectionApp(QMainWindow):
         self.stop_detection()
         
         # 打开文件对话框选择视频
-        file_path, _ = QFileDialog.getOpenFileName(self, "选择视频", "", "视频文件 (*.mp4 *.avi *.mov)")
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Video", "", "Video Files (*.mp4 *.avi *.mov)")
         
         if file_path:
             # 打开视频
             self.cap = cv2.VideoCapture(file_path)
             if not self.cap.isOpened():
-                self.status_label.setText("无法打开视频")
+                self.status_label.setText("Failed to open video")
                 return
             
             # 开始定时器
             self.timer.start(30)  # 约30fps
-            self.status_label.setText("正在播放视频...")
+            self.status_label.setText("Playing video...")
     
     def open_camera(self):
         # 停止任何正在进行的视频检测
@@ -313,12 +411,12 @@ class DetectionApp(QMainWindow):
         # 打开摄像头
         self.cap = cv2.VideoCapture(0)
         if not self.cap.isOpened():
-            self.status_label.setText("无法打开摄像头")
+            self.status_label.setText("Failed to open camera")
             return
         
         # 开始定时器
         self.timer.start(30)  # 约30fps
-        self.status_label.setText("摄像头已打开")
+        self.status_label.setText("Camera opened")
     
     def update_frame(self):
         if self.cap is None or not self.cap.isOpened():
@@ -329,7 +427,7 @@ class DetectionApp(QMainWindow):
         ret, frame = self.cap.read()
         if not ret:
             self.stop_detection()
-            self.status_label.setText("视频播放结束")
+            self.status_label.setText("Video playback finished")
             return
         
         # 获取当前参数
@@ -340,20 +438,30 @@ class DetectionApp(QMainWindow):
         detections = self.detector.detect(frame, conf_threshold, iou_threshold)
         
         # 在图像上绘制检测结果
+        su7_count = 0
         for det in detections:
             box = det['box']
             score = det['score']
+            class_id = det['class_id']
+            
+            # 确定标签文本和颜色
+            if class_id == 0:
+                label_text = f"SU7: {score:.2f}"
+                color = (0, 255, 0)  # 绿色
+                su7_count += 1
+            else:
+                label_text = f"Other: {score:.2f}"
+                color = (0, 165, 255)  # 橙色
             
             # 绘制边界框
-            cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 2)
+            cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), color, 2)
             
             # 绘制标签
-            label = f"Object-{det['class_id']}: {score:.2f}"
-            cv2.putText(frame, label, (box[0], box[1] - 10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            cv2.putText(frame, label_text, (box[0], box[1] - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
-        # 更新状态
-        self.status_label.setText(f"检测到 {len(detections)} 个小米SU7")
+        # 更新状态，只显示SU7的数量
+        self.status_label.setText(f"Detected {su7_count} Xiaomi SU7")
         
         # 显示图像
         self.display_image(frame)
@@ -367,7 +475,7 @@ class DetectionApp(QMainWindow):
             self.cap.release()
             self.cap = None
         
-        self.status_label.setText("就绪")
+        self.status_label.setText("Ready")
     
     def display_image(self, img):
         # 转换为RGB
@@ -385,6 +493,28 @@ class DetectionApp(QMainWindow):
                               Qt.KeepAspectRatio, Qt.SmoothTransformation)
         
         self.image_label.setPixmap(pixmap)
+        
+        # 保存当前处理后的图像用于保存功能
+        self.current_display_image = img
+    
+    def save_result(self):
+        # 检查是否有图像可以保存
+        if not hasattr(self, 'current_display_image') or self.current_display_image is None:
+            self.status_label.setText("No image to save")
+            return
+        
+        # 打开文件对话框选择保存路径
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save Result", "", "Image Files (*.jpg *.jpeg *.png)")
+        
+        if file_path:
+            # 确保文件扩展名正确
+            if not (file_path.endswith('.jpg') or file_path.endswith('.jpeg') or file_path.endswith('.png')):
+                file_path += '.jpg'
+            
+            # 保存图像
+            cv2.imwrite(file_path, self.current_display_image)
+            self.status_label.setText(f"Result saved to: {file_path}")
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
